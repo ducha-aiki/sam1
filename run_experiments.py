@@ -13,8 +13,9 @@ def readSIFT2M():
 small_db,Names = readSmallDescAndFnames()
 SIFT2M = readSIFT2M().astype(np.float32)
 k = 32000
-th = 0.00000001
-methods = ["ExactGPU",  "FLANN_KMeansTree", "FLANN_KDTree" ]
+th = 0#0.00000001
+#"ExactGPU", 
+methods = ["FLANN_KDTree","FLANN_KMeansTree", "FAISS_GPU_IPQ", "FAISS_CPU_IPQ", "FAISSGPU", "ExactGPU", "FAISSCPU",  "Exact"]
 KMO = KMeansClass(SIFT2M)
 results = dict()
 calcSSD_every_kth_iter = 1;
@@ -22,9 +23,9 @@ for method in methods:
     print method
     current_results = {}
     lab,cent = KMO.KMeans(k,th,max_iter = 30, timings = True,
-                               method = method, max_mem_size = 2100 * 128 * 1000 * 1000, calcSSD_every_kth_iter = calcSSD_every_kth_iter)
+                               method = method, max_mem_size = 200 * 128 * 1000 * 1000, calcSSD_every_kth_iter = calcSSD_every_kth_iter)
     current_results["labels"] = lab
     current_results["centers"] = cent
     current_results["SSD"] = KMO.SSD_list
     results[method] = current_results
-    pickle.dump(results, open("results2.pickle", "wb"), protocol = 2)
+    pickle.dump(results, open("results_new_fix_faiss_ipq.pickle", "wb"), protocol = 2)

@@ -3,27 +3,32 @@ import time
 import os
 import math
 import gc
-import theano
-import theano.tensor as T
+#import theano
+#import theano.tensor as T
 from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.metrics.pairwise import paired_distances
+import sys
+sys.path.insert(0, '/home/old-ufo/dev/faiss')
+import faiss 
 from pyflann import *
-X = T.fmatrix('X')
-X_sq = T.fmatrix('X_sq')
+#X = T.fmatrix('X')
+#X_sq = T.fmatrix('X_sq')
 
-Y = T.fmatrix('Y')
-Y_sq = T.fmatrix('Y_sq')
-P = T.scalar('P')
+#Y = T.fmatrix('Y')
+#Y_sq = T.fmatrix('Y_sq')
+#P = T.scalar('P')
 
-squared_euclidean_distances = X_sq.reshape((X.shape[0], 1)) + Y_sq.reshape((1, Y.shape[0])) - 2 * X.dot(Y.T)
-theano_dist_argmin = T.argmin(X_sq.reshape((X.shape[0], 1)) + Y_sq.reshape((1, Y.shape[0])) - 2 * X.dot(Y.T),axis = 1)
-gpu_euclidean = theano.function([X, Y, X_sq, Y_sq], squared_euclidean_distances)
-gpu_euc_argmin =  theano.function([X, Y, X_sq, Y_sq], theano_dist_argmin)
+#squared_euclidean_distances = X_sq.reshape((X.shape[0], 1)) + Y_sq.reshape((1, Y.shape[0])) - 2 * X.dot(Y.T)
+#theano_dist_argmin = T.argmin(X_sq.reshape((X.shape[0], 1)) + Y_sq.reshape((1, Y.shape[0])) - 2 * X.dot(Y.T),axis = 1)
+#gpu_euclidean = theano.function([X, Y, X_sq, Y_sq], squared_euclidean_distances)
+#gpu_euc_argmin =  theano.function([X, Y, X_sq, Y_sq], theano_dist_argmin)
 
 class KMeansClass(object):
     def __init__(self, inputdb, batch_size = 1):
         self.db = inputdb;
         self.dbsize,self.dim = inputdb.shape
         self.labels = np.zeros((self.dbsize), dtype = np.int32)
+        self.dists = 9999999999999. * np.ones((self.dbsize), dtype = np.float32)
         self.norms_squared = np.zeros((self.dbsize))
         self.batch_size = batch_size;
         return
@@ -72,7 +77,7 @@ class KMeansClass(object):
                 dists =  euclidean_distances(query,self.centers, squared = True, 
                                              X_norm_squared = self.norms_squared[curr_idxs].reshape(-1,1),
                                              Y_norm_squared = centers_norms_squared)
-                self.labels[curr_idxs] = np.argmin(dists, axis = 1) 
+                self.labels[curr_idxs] = np.argmin( dists, axis = 1) 
             last_batch_idxs = np.arange(n_batches*self.batch_size,self.dbsize);
             query = self.db[last_batch_idxs,:]#.reshape(-1,self.dim)
             dists =  euclidean_distances(query,self.centers, squared = True, 
@@ -91,14 +96,103 @@ class KMeansClass(object):
         nn = FLANN()
         nn.build_index(self.centers,  algorithm='kdtree', trees=4)
         idx,dists = nn.nn_index(self.db,1)
-        self.labels = np.array(idx)
+        dists = np.array(dists)
+        prev_closest_clusters = self.centers[self.labels,:]
+        curr_tentative_clusters = self.centers[idx,:]
+        #print prev_closest_clusters.shape
+        dists2 =  paired_distances(self.db,prev_closest_clusters, metric='euclidean')
+        dists3 =  paired_distances(self.db,curr_tentative_clusters, metric='euclidean')
+        to_update  = np.where(dists3 < dists2)[0]
+        print len(to_update), "points updated"
+        #sys.exit(0)
+        self.labels[to_update] = np.array(idx)[to_update]
+        self.dists[to_update] = dists[to_update]
         return
     def assignPointsToClustersFLANNKMeansTree(self):
         nn = FLANN()
         nn.build_index(self.centers,  algorithm='kmeans', trees=4)
         idx,dists = nn.nn_index(self.db,1)
-        self.labels = np.array(idx)
+        dists = np.array(dists)
+        prev_closest_clusters = self.centers[self.labels,:]
+        curr_tentative_clusters = self.centers[idx,:]
+        #print prev_closest_clusters.shape
+        dists2 =  paired_distances(self.db,prev_closest_clusters, metric='euclidean')
+        dists3 =  paired_distances(self.db,curr_tentative_clusters, metric='euclidean')
+        to_update  = np.where(dists3 < dists2)[0]
+        print len(to_update), "points updated"
+        self.labels[to_update] = np.array(idx)[to_update]
+        self.dists[to_update] = dists[to_update]
+        #to_update  = np.where(dists < self.dists)[0]
+        #self.labels[to_update] = np.array(idx)[to_update]
+        #print len(to_update), "points updated"
+        #self.dists[to_update] = dists[to_update]
+        #self.labels = np.array(idx)
         #print self.labels.min(), self.labels.max(), self.labels.mean();
+        return
+    def assignPointsToClustersFAISS(self):
+        nn = faiss.IndexFlatL2(self.dim)
+        nn.add(self.centers)
+        dists,idxs = nn.search(self.db, 1)
+        print dists.shape,idxs.shape
+        #idx,dists = nn.nn_index(self.db,1)
+        dists = np.array(dists[:,0])
+        self.labels = np.array(idxs[:,0])
+        self.dists = dists
+        return
+    def assignPointsToClustersFAISS_GPU_IPQ(self):
+        dev_no = 0
+        res = faiss.StandardGpuResources()
+        flat_config = faiss.GpuIndexFlatConfig()
+        flat_config.device = dev_no
+        gt_index = faiss.GpuIndexFlatL2(res, self.dim, flat_config)
+        coarse_quantizer = gt_index
+        ncentroids = int(np.sqrt(self.k) * 4)
+        index_cpu = faiss.IndexIVFPQ(coarse_quantizer, self.dim, ncentroids, 32, 8)
+        # add implemented on GPU but not train
+        gpuIndex =   faiss.GpuIndexIVFPQ(res, dev_no, faiss.INDICES_64_BIT,False, index_cpu)
+        gpuIndex.train(self.centers)
+        gpuIndex.add(self.centers)
+        dists,idx = gpuIndex.search(self.db, 1)
+        prev_closest_clusters = self.centers[self.labels,:]
+        curr_tentative_clusters = self.centers[idx[:,0],:]
+        #print prev_closest_clusters.shape
+        dists2 =  paired_distances(self.db,prev_closest_clusters, metric='euclidean')
+        dists3 =  paired_distances(self.db,curr_tentative_clusters, metric='euclidean')
+        to_update  = np.where(dists3 < dists2)[0]
+        print len(to_update), "points updated"
+        self.labels[to_update] = np.array(idx[:,0])[to_update]
+        return    
+    def assignPointsToClustersFAISS_IPQ(self):
+        ncentroids = int(np.sqrt(self.k) * 4)
+        m = 8
+        quantizer = faiss.IndexFlatL2(self.dim)  # this remains the same
+        index = faiss.IndexIVFPQ(quantizer, self.dim, ncentroids, m, 8)
+        index.train(self.centers)
+        index.add(self.centers)
+        dists,idx = index.search(self.db, 1)
+        print idx.shape
+        prev_closest_clusters = self.centers[self.labels,:]
+        curr_tentative_clusters = self.centers[idx[:,0],:]
+        #print prev_closest_clusters.shape
+        dists2 =  paired_distances(self.db,prev_closest_clusters, metric='euclidean')
+        dists3 =  paired_distances(self.db,curr_tentative_clusters, metric='euclidean')
+        to_update  = np.where(dists3 < dists2)[0]
+        print len(to_update), "points updated"
+        self.labels[to_update] = np.array(idx[:,0])[to_update]
+        #self.dists[to_update] = dists[to_update]
+        return    
+    def assignPointsToClustersGPUFAISS(self):
+        flat_config = faiss.GpuIndexFlatConfig()
+        flat_config.device = 0
+        res = faiss.StandardGpuResources()
+        nn = faiss.GpuIndexFlatL2(res, self.dim, flat_config)
+        nn.add(self.centers)
+        dists,idxs = nn.search(self.db, 1)
+        print dists.shape,idxs.shape
+        #idx,dists = nn.nn_index(self.db,1)
+        dists = np.array(dists[:,0])
+        self.labels = np.array(idxs[:,0])
+        self.dists = dists
         return
     def updateClusterCenters(self, calcSSD):
         #centers_norms_squared = (self.centers**2).sum(axis=1)
@@ -117,7 +211,7 @@ class KMeansClass(object):
                     try:
                         dists = euclidean_distances(self.centers[i,:].reshape(1,-1),self.db[idxs,:], squared = False,
                                                  Y_norm_squared = self.norms_squared[idxs]) 
-                        SSD += dists.mean() / self.k
+                        SSD += dists.mean() / float(self.k)
                     except:
                         print i, idxs
                 self.centers[i,:] = self.db[idxs,:].mean(axis = 0);
@@ -160,6 +254,14 @@ class KMeansClass(object):
                 self.assignPointsToClustersExact()
             elif method == "ExactGPU":
                 self.assignPointsToClustersExactGPU()
+            elif method == "FAISSCPU":
+                self.assignPointsToClustersFAISS()
+            elif method == "FAISSGPU":
+                self.assignPointsToClustersGPUFAISS()
+            elif method == "FAISS_CPU_IPQ":
+                self.assignPointsToClustersFAISS_IPQ()
+            elif method == "FAISS_GPU_IPQ":
+                self.assignPointsToClustersFAISS_GPU_IPQ()
             elif method == "FLANN_KDTree":
                 self.assignPointsToClustersFLANNKDTree()
             elif method == "FLANN_KMeansTree":
